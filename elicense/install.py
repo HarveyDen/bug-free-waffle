@@ -150,11 +150,28 @@ def main():
 
     # 5. профили
     step(5, total, "Профили (логины портала)")
-    say("  Каждый логин — отдельный профиль браузера со своими cookie.")
-    say("  Придумайте им короткие имена латиницей, через пробел.")
+    existing = []
+    try:
+        from download_zayavleniya import chrome_profiles
+        existing = chrome_profiles()
+    except Exception:
+        pass
+    if existing:
+        say("  У вас уже есть профили в самом Chrome:")
+        for folder, name in existing:
+            say("    • %s  (папка %s)" % (name, folder))
+        say()
+        say("  Если вы уже входили в портал под ними, отдельные профили не нужны —")
+        if platform.system() == "Windows":
+            say('  просто закройте Chrome и запустите "Скачать через профили Chrome.bat".')
+        else:
+            say("  просто закройте Chrome и запустите:  python3 chrome_run.py")
+        say()
+    say("  Либо заведём отдельные профили скрипта — они не трогают ваш Chrome")
+    say("  и работают, даже когда он открыт. Имена латиницей, через пробел.")
     say("  Например:  ivanov petrov ktransgroup")
     say()
-    names = ask("  Имена профилей (Enter — пропустить вход сейчас): ").split()
+    names = ask("  Имена профилей (Enter — пропустить): ").split()
 
     if not names:
         say()
@@ -189,11 +206,15 @@ def finish(out):
     say("  Готово. Дальше:")
     say("=" * 60)
     if platform.system() == "Windows":
-        say('  Скачать заявления      — двойной клик по "Скачать заявления.bat"')
-        say('  Следить постоянно      — двойной клик по "Следить за новыми.bat"')
+        say('  Скачать заявления        — "Скачать заявления.bat"')
+        say('  Через профили Chrome     — "Скачать через профили Chrome.bat"')
+        say('  Следить постоянно        — "Следить за новыми.bat"')
+        say('  Если что-то не так       — "Диагностика.bat"')
     else:
-        say("  Скачать заявления      —  python3 download_zayavleniya.py run")
-        say("  Следить постоянно      —  python3 download_zayavleniya.py run --watch 30")
+        say("  Скачать заявления        —  python3 download_zayavleniya.py run")
+        say("  Через профили Chrome     —  python3 chrome_run.py")
+        say("  Следить постоянно        —  python3 download_zayavleniya.py run --watch 30")
+        say("  Если что-то не так       —  python3 download_zayavleniya.py doctor")
     say()
     say("  Файлы будут складываться в:")
     say("      %s" % out)

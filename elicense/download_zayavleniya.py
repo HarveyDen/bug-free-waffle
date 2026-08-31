@@ -261,14 +261,102 @@ def known_profiles(base=None):
     return sorted(p.name for p in root.iterdir() if p.is_dir())
 
 
-def launch_context(pw, args, profile=None):
-    """Запуск Chrome с постоянным профилем (cookie переживают перезапуск)."""
-    if args.user_data_dir:                      # режим "родной профиль Chrome"
-        udd = Path(args.user_data_dir).expanduser()
-        extra = ["--profile-directory=%s" % args.profile_directory] if args.profile_directory else []
+# --- профили самого Chrome (те, что вы заводите кнопкой "Добавить профиль") ---
+
+def chrome_user_data_dir():
+    """Каталог User Data установленного Chrome."""
+    system = platform.system()
+    candidates = []
+    if system == "Windows":
+        local = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData/Local")
+        candidates = [Path(local) / "Google/Chrome/User Data"]
+    elif system == "Darwin":
+        candidates = [Path.home() / "Library/Application Support/Google/Chrome"]
     else:
-        udd = profile_dir(profile, args.profiles_dir)
-        extra = []
+        candidates = [Path.home() / ".config/google-chrome",
+                      Path.home() / ".config/chromium"]
+    for path in candidates:
+        if path.is_dir():
+            return path
+    return None
+
+
+def chrome_profiles():
+    """Список профилей Chrome: [(папка, отображаемое имя), ...].
+
+    Имена берём из Local State — это то, что вы видите в самом Chrome
+    ("Иван", "Работа" и т.д.), а не служебные Default / Profile 1.
+    """
+    udd = chrome_user_data_dir()
+    if not udd:
+        return []
+    names = {}
+    state = udd / "Local State"
+    if state.is_file():
+        try:
+            with state.open(encoding="utf-8", errors="replace") as f:
+                info = json.load(f).get("profile", {}).get("info_cache", {})
+            names = {k: (v.get("name") or k) for k, v in info.items()}
+        except (OSError, ValueError):
+            names = {}
+    found = []
+    for item in sorted(udd.iterdir()) if udd.is_dir() else []:
+        if item.is_dir() and (item.name == "Default" or item.name.startswith("Profile ")):
+            found.append((item.name, names.get(item.name, item.name)))
+    return found
+
+
+def find_chrome_profile(wanted):
+    """Ищет профиль Chrome по отображаемому имени или по имени папки."""
+    wanted_low = (wanted or "").strip().lower()
+    for folder, name in chrome_profiles():
+        if wanted_low in (folder.lower(), name.lower()):
+            return folder, name
+    return None, None
+
+
+def resolve_profiles(args):
+    """Превращает аргументы в список профилей для обхода.
+
+    Возвращает список словарей: name (ключ в состоянии и в логе),
+    user_data_dir и profile_directory (для профилей самого Chrome — иначе None).
+    """
+    specs = []
+
+    # 1. Профили самого Chrome, выбранные по имени
+    for wanted in getattr(args, "chrome_profiles", None) or []:
+        folder, name = find_chrome_profile(wanted)
+        if not folder:
+            log("Профиль Chrome '%s' не найден. Доступные: %s" %
+                (wanted, ", ".join("%s (%s)" % (n, f) for f, n in chrome_profiles()) or "нет"))
+            continue
+        specs.append({"name": name, "user_data_dir": chrome_user_data_dir(),
+                      "profile_directory": folder, "chrome": True})
+
+    # 2. Явно указанный каталог Chrome
+    if getattr(args, "user_data_dir", None):
+        specs.append({"name": args.profile_directory or "chrome",
+                      "user_data_dir": Path(args.user_data_dir).expanduser(),
+                      "profile_directory": args.profile_directory, "chrome": True})
+
+    # 3. Отдельные профили скрипта.
+    # Автоподбор — только если пользователь ничего не указывал явно: иначе
+    # опечатка в имени профиля Chrome тихо увела бы выгрузку не туда.
+    asked_chrome = bool(getattr(args, "chrome_profiles", None) or
+                        getattr(args, "user_data_dir", None))
+    explicit = getattr(args, "profiles", None)
+    names = explicit if explicit else ([] if asked_chrome else known_profiles(args.profiles_dir))
+    for name in names:
+        specs.append({"name": name, "user_data_dir": profile_dir(name, args.profiles_dir),
+                      "profile_directory": None, "chrome": False})
+    return specs
+
+
+def launch_context(pw, args, spec):
+    """Запуск Chrome с постоянным профилем (cookie переживают перезапуск)."""
+    udd = Path(spec["user_data_dir"])
+    extra = (["--profile-directory=%s" % spec["profile_directory"]]
+             if spec.get("profile_directory") else [])
     udd.mkdir(parents=True, exist_ok=True)
 
     browser_args = ["--disable-blink-features=AutomationControlled",
@@ -493,14 +581,23 @@ def download_request(api, row, out_dir, sources, lang):
 # Основной проход по профилю
 # --------------------------------------------------------------------------
 
-def crawl_profile(pw, args, profile, state, out_dir):
+def crawl_profile(pw, args, spec, state, out_dir):
     """Обходит списки заявлений профиля и скачивает всё новое."""
+    profile = spec["name"]
     log("=" * 62)
-    log("Профиль: %s" % profile)
+    log("Профиль: %s%s" % (profile, " (профиль Chrome)" if spec.get("chrome") else ""))
     seen = profile_state(state, profile)
     stats = {"new": 0, "skip": 0, "fail": 0, "seen": 0}
 
-    ctx = launch_context(pw, args, profile)
+    try:
+        ctx = launch_context(pw, args, spec)
+    except Exception as exc:
+        first = str(exc).splitlines()[0][:200]
+        log("  Не удалось запустить браузер: %s" % first)
+        if spec.get("chrome"):
+            log("  Похоже, Chrome сейчас запущен. Закройте ВСЕ окна Chrome и повторите:")
+            log("  профиль Chrome можно открыть только когда сам Chrome закрыт.")
+        return stats
     try:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         api = ctx.request          # общие с браузером cookie
@@ -626,12 +723,14 @@ def require_playwright():
 def cmd_setup(args):
     """Создать профили и войти в портал под каждым (вручную, по очереди)."""
     sync_playwright = require_playwright()
-    names = args.names or ["default"]
+    args.profiles = args.names or ["default"]
+    specs = resolve_profiles(args)
     with sync_playwright() as pw:
-        for name in names:
-            log("Открываю Chrome для профиля '%s'" % name)
+        for spec in specs:
+            log("Открываю Chrome для профиля '%s'" % spec["name"])
+            log("  каталог профиля: %s" % spec["user_data_dir"])
             try:
-                ctx = launch_context(pw, args, name)
+                ctx = launch_context(pw, args, spec)
             except Exception as exc:
                 log("Не удалось запустить браузер: %s" % str(exc).splitlines()[0][:200])
                 log("Установите Chrome либо выполните: %s -m playwright install chromium"
@@ -640,31 +739,39 @@ def cmd_setup(args):
                 return
             try:
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
-                ok = ensure_login(page, ctx.request, name, unattended=False,
+                ok = ensure_login(page, ctx.request, spec["name"], unattended=False,
                                   wait_seconds=args.login_wait)
                 if ok:
-                    log("Профиль '%s' готов. Окно можно закрыть." % name)
+                    log("Профиль '%s' готов. Окно можно закрыть." % spec["name"])
                     if not args.keep_open:
                         input("Нажмите Enter, чтобы перейти к следующему профилю... ")
                 else:
-                    log("Профиль '%s' не авторизован." % name)
+                    log("Профиль '%s' не авторизован — вход не выполнен." % spec["name"])
             finally:
                 try:
                     ctx.close()
                 except Exception:
                     pass
-    log("Профили: %s" % ", ".join(known_profiles(args.profiles_dir)) or "нет")
+    ready = known_profiles(args.profiles_dir)
+    log("Заведённые профили (%s): %s" % (profiles_root(args), ", ".join(ready) or "нет"))
+
+
+def profiles_root(args):
+    base = getattr(args, "profiles_dir", None)
+    return Path(base).expanduser() if base else PROFILES_DIR
 
 
 def cmd_list(args):
     names = known_profiles(args.profiles_dir)
     state = load_state()
+    print("Папка профилей: %s" % profiles_root(args))
     if not names:
-        print("Профилей нет. Создайте: python3 %s setup имя1 имя2"
-              % Path(sys.argv[0]).name)
+        print("Профилей нет. Создайте:  %s %s setup имя1 имя2"
+              % (Path(sys.executable).name, Path(sys.argv[0]).name))
+        print()
+        print("Или используйте профили самого Chrome:")
+        print("  %s %s chrome-profiles" % (Path(sys.executable).name, Path(sys.argv[0]).name))
         return
-    print("Папка профилей: %s" % (Path(args.profiles_dir).expanduser()
-                                  if args.profiles_dir else PROFILES_DIR))
     for n in names:
         done = sum(1 for v in state["profiles"].get(n, {}).values() if v.get("ok"))
         bad = sum(1 for v in state["profiles"].get(n, {}).values() if not v.get("ok"))
@@ -672,19 +779,102 @@ def cmd_list(args):
     print("Файлы: %s" % target_dir(args.out))
 
 
+def cmd_chrome_profiles(args):
+    """Показать профили установленного Chrome."""
+    udd = chrome_user_data_dir()
+    print("Каталог Chrome: %s" % (udd or "не найден"))
+    found = chrome_profiles()
+    if not found:
+        print("Профили Chrome не найдены.")
+        print("Проверьте, что Chrome установлен и вы хотя бы раз его запускали.")
+        return
+    print("Профили Chrome:")
+    for folder, name in found:
+        print("  • %-24s (папка %s)" % (name, folder))
+    exe = "%s %s" % (Path(sys.executable).name, Path(sys.argv[0]).name)
+    print()
+    print("Скачать под ними (Chrome должен быть ПОЛНОСТЬЮ закрыт):")
+    print("  %s run %s" % (exe, " ".join('--chrome-profile "%s"' % n for _, n in found)))
+
+
+def cmd_doctor(args):
+    """Диагностика: показывает всё, что нужно для разбора проблем."""
+    exe = "%s %s" % (Path(sys.executable).name, Path(sys.argv[0]).name)
+    print("=" * 62)
+    print("  Диагностика выгрузки заявлений")
+    print("=" * 62)
+    print("Python:            %s" % sys.version.split()[0])
+    print("Интерпретатор:     %s" % sys.executable)
+    print("Система:           %s" % platform.platform())
+    print("Домашняя папка:    %s" % Path.home())
+    print("Рабочий стол:      %s" % desktop_dir())
+    out = desktop_dir() / "Заявления"
+    print("Папка выгрузки:    %s  (существует: %s, файлов: %s)"
+          % (out, "да" if out.is_dir() else "НЕТ",
+             len(list(out.glob("*.pdf"))) if out.is_dir() else 0))
+    print()
+    try:
+        import playwright  # noqa: F401
+        print("playwright:        установлен")
+    except ImportError:
+        print("playwright:        НЕ УСТАНОВЛЕН  ->  %s -m pip install playwright"
+              % Path(sys.executable).name)
+
+    print()
+    print("--- Профили скрипта ---")
+    root = profiles_root(args)
+    print("Папка профилей:    %s  (существует: %s)" % (root, "да" if root.is_dir() else "НЕТ"))
+    names = known_profiles(args.profiles_dir)
+    if names:
+        for n in names:
+            p = profile_dir(n, args.profiles_dir)
+            cookies = (p / "Default" / "Cookies").exists() or (p / "Cookies").exists()
+            print("  • %-20s вход сохранён: %s" % (n, "похоже, да" if cookies else "нет"))
+    else:
+        print("  профилей нет — их создаёт команда:  %s setup имя1 имя2" % exe)
+
+    print()
+    print("--- Профили самого Chrome ---")
+    udd = chrome_user_data_dir()
+    print("Каталог Chrome:    %s" % (udd or "не найден"))
+    for folder, name in chrome_profiles():
+        print("  • %-24s (папка %s)" % (name, folder))
+    if not chrome_profiles():
+        print("  не найдены")
+
+    print()
+    print("--- Что уже скачано ---")
+    state = load_state()
+    if not state.get("profiles"):
+        print("  ничего (state.json пуст)")
+    for pname, items in state.get("profiles", {}).items():
+        ok = sum(1 for v in items.values() if v.get("ok"))
+        bad = sum(1 for v in items.values() if not v.get("ok"))
+        print("  • %-20s успешно: %-6d ошибок: %d" % (pname, ok, bad))
+    print()
+    print("Служебные файлы:   %s" % HOME_DIR)
+    print("Лог:               %s" % LOG_FILE)
+
+
 def cmd_run(args):
     sync_playwright = require_playwright()
-    profiles = args.profiles or known_profiles(args.profiles_dir)
-    if args.user_data_dir:
-        profiles = profiles or ["chrome"]
-    if not profiles:
-        print("Нет ни одного профиля. Сначала: python3 %s setup имя1 имя2"
-              % Path(sys.argv[0]).name, file=sys.stderr)
+    specs = resolve_profiles(args)
+    if not specs:
+        exe = "%s %s" % (Path(sys.executable).name, Path(sys.argv[0]).name)
+        print("Нет ни одного профиля.", file=sys.stderr)
+        print("Искал здесь: %s" % profiles_root(args), file=sys.stderr)
+        print(file=sys.stderr)
+        print("Заведите профиль и войдите в портал:", file=sys.stderr)
+        print("    %s setup имя1 имя2" % exe, file=sys.stderr)
+        print("Либо используйте профили самого Chrome:", file=sys.stderr)
+        print("    %s chrome-profiles" % exe, file=sys.stderr)
+        print("Подробная диагностика:", file=sys.stderr)
+        print("    %s doctor" % exe, file=sys.stderr)
         raise SystemExit(1)
 
     out_dir = target_dir(args.out)
     log("Папка выгрузки: %s" % out_dir)
-    log("Профили: %s" % ", ".join(profiles))
+    log("Профили: %s" % ", ".join(s["name"] for s in specs))
 
     state = load_state()
     iteration = 0
@@ -692,13 +882,14 @@ def cmd_run(args):
         iteration += 1
         totals = {"new": 0, "skip": 0, "fail": 0}
         with sync_playwright() as pw:
-            for profile in profiles:
+            for spec in specs:
                 try:
-                    st = crawl_profile(pw, args, profile, state, out_dir)
+                    st = crawl_profile(pw, args, spec, state, out_dir)
                 except KeyboardInterrupt:
                     raise
                 except Exception as exc:
-                    log("Профиль '%s': сбой — %s" % (profile, str(exc).splitlines()[0][:200]))
+                    log("Профиль '%s': сбой — %s"
+                        % (spec["name"], str(exc).splitlines()[0][:200]))
                     continue
                 for k in totals:
                     totals[k] += st.get(k, 0)
@@ -738,6 +929,11 @@ def add_browser_args(p):
                                          "если он стоит не в стандартном месте")
     p.add_argument("--no-sandbox", action="store_true",
                    help="запускать браузер с --no-sandbox (нужно в редких случаях)")
+    p.add_argument("--chrome-profile", dest="chrome_profiles", action="append",
+                   metavar="ИМЯ",
+                   help="использовать профиль самого Chrome по его имени "
+                        "(список: команда chrome-profiles). Chrome должен быть закрыт. "
+                        "Можно указать несколько раз")
 
 
 def parse_pages_range(value):
@@ -779,6 +975,14 @@ def build_parser():
     l.add_argument("--out", help="папка выгрузки")
     add_browser_args(l)
     l.set_defaults(func=cmd_list)
+
+    c = sub.add_parser("chrome-profiles", help="показать профили установленного Chrome")
+    add_browser_args(c)
+    c.set_defaults(func=cmd_chrome_profiles)
+
+    d = sub.add_parser("doctor", help="диагностика: что установлено, где профили и файлы")
+    add_browser_args(d)
+    d.set_defaults(func=cmd_doctor)
 
     r = sub.add_parser("run", help="скачать заявления по всем профилям")
     r.add_argument("-p", "--profile", dest="profiles", action="append",
@@ -826,7 +1030,9 @@ def main(argv=None):
         if args.full_scan:
             args.stop_after_known = 0
     for name, default in (("unattended", False), ("include_pending", False),
-                          ("headless", False), ("out", None)):
+                          ("headless", False), ("out", None), ("profiles", None),
+                          ("chrome_profiles", None), ("profiles_dir", None),
+                          ("user_data_dir", None), ("profile_directory", None)):
         if not hasattr(args, name):
             setattr(args, name, default)
     try:

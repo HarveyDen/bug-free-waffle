@@ -630,7 +630,14 @@ def cmd_setup(args):
     with sync_playwright() as pw:
         for name in names:
             log("Открываю Chrome для профиля '%s'" % name)
-            ctx = launch_context(pw, args, name)
+            try:
+                ctx = launch_context(pw, args, name)
+            except Exception as exc:
+                log("Не удалось запустить браузер: %s" % str(exc).splitlines()[0][:200])
+                log("Установите Chrome либо выполните: %s -m playwright install chromium"
+                    % Path(sys.executable).name)
+                log("Если Chrome стоит нестандартно, укажите путь: --chrome-path \"...\"")
+                return
             try:
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 ok = ensure_login(page, ctx.request, name, unattended=False,
